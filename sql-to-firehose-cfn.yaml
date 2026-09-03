@@ -1,0 +1,553 @@
+# Prerequisites — complete before deploying:
+# 1) Inbound database: Provision a source Database (e.g., MySQL) with binlog enabled and a user with replication privileges.
+#    https://docs.aws.amazon.com/dms/latest/userguide/CHAP_Source.html
+#
+# 2) AWS Database Migration Service (DMS) Source Endpoint: Create a source endpoint pointing to your database
+#    https://docs.aws.amazon.com/dms/latest/userguide/CHAP_Endpoints.Creating.html
+#
+# 3) AWS Secrets Manager secret: Note the secret ARN for the DmsSourceSecretArn parameter.
+#    https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_DMS_migration-IAM.secret-iam-role-policy.html
+#
+# 4) Inbound networking:
+#    - Create a AWS DMS replication subnet group (≥2 AZs, connectivity to source DB).
+#    - Create/identify a security group allowing traffic to the source DB port.
+#    Note the subnet group ID and security group ID for parameters below.
+#    https://docs.aws.amazon.com/dms/latest/userguide/CHAP_ReplicationInstance.VPC.html
+#
+# 5) Outbound Iceberg table: Create an Amazon S3 bucket and an AWS Glue Iceberg table.
+#    https://docs.aws.amazon.com/athena/latest/ug/querying-iceberg-creating-tables.html
+
+# Deploy example:
+#   aws cloudformation create-stack --stack-name amzn-blog-demo \
+#     --template-body file://sql-to-firehose-cfn.yaml \
+#     --capabilities CAPABILITY_NAMED_IAM \
+#     --parameters \
+#       ParameterKey=DmsSourceEndpointArn,ParameterValue=arn:aws:dms:us-east-1:123456789012:endpoint:my-source-endpoint \
+#       ParameterKey=DmsSourceSecretArn,ParameterValue=arn:aws:secretsmanager:us-east-1:123456789012:secret:my-dms-secret \
+#       ParameterKey=DmsSubnetGroupId,ParameterValue=my-dms-subnet-group \
+#       ParameterKey=DmsVpcSecurityGroupId,ParameterValue=sg-0123456789abcdef0
+
+# Verify deployment:
+#   1. Check stack status:
+#        aws cloudformation describe-stacks --stack-name amzn-blog-demo --query 'Stacks[0].StackStatus'
+#   2. Verify DMS replication is running: 
+# aws dms describe-replications --filters Name=replication-config-arn,Values=<output-arn> 
+#   3. Check Kinesis stream has incoming records: 
+# aws kinesis describe-stream-summary --stream-name amzn-blog-demo-kinesis 
+#   4. Verify Lambda function invocations: 
+# aws cloudwatch get-metric-statistics --namespace AWS/Lambda --metric-name Invocations --dimensions Name=FunctionName,Value=amzn-blog-demo-lambda-processor --start-time <timestamp> --end-time <timestamp> --period 300 --statistics Sum 
+#   5. Query Iceberg table for replicated data: 
+# aws athena start-query-execution --query-string "SELECT COUNT(*) FROM market_db.market_rule" --result-configuration OutputLocation=s3://your-results-bucket/
+
+# Cleanup:
+#   To avoid ongoing charges, delete the stack when no longer needed:
+#     aws cloudformation delete-stack --stack-name amzn-blog-demo
+#
+#   Verify deletion:
+#     aws cloudformation describe-stacks --stack-name amzn-blog-demo
+#   (Should return stack status DELETE_COMPLETE or stack not found)
+#
+#   Note: The S3 bucket (specified in S3BucketName parameter) is not created or deleted by this template. After deleting the stack, the bucket and all Iceberg table data will remain in your account and continue to incur storage charges. 
+#   WARNING: If you manually delete the S3 bucket, all data will be permanently lost. Before deleting the bucket, ensure you have backed up any data you need to retain.'
+#
+#   Resources deleted with stack:
+#     - Amazon Kinesis Data Streams stream 
+#     - AWS Lambda function and log group
+#     - Amazon Data Firehose delivery stream and log group
+#     - AWS DMS Serverless replication configuration
+#     - AWS Key Management Service (AWS KMS) key for log encryption
+#     - AWS IAM roles (lambda-role, firehose-role, dms-role)
+#
+#   Resources NOT managed by this template:
+#     - Amazon S3 bucket (you must create and delete separately)
+#     - DMS source endpoint (pre-existing)
+#     - DMS subnet group (pre-existing)
+#     - VPC security group (pre-existing)
+
+# Security Considerations (not included in this template):
+#   - Set up Amazon CloudWatch alarms for security
+#   - Use VPC endpoints to keep traffic off the public internet
+#   - Encrypt inbound and outbound data stores
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Source Endpoint -> AWS DMS -> Amazon Kinesis Data Streams -> Amazon Data Firehose (via AWS Lambda) -> Apache Iceberg pipeline with AWS DMS Serverless CDC from MySQL Server.
+  IAM roles embedded. WARNING: This template creates billable resources. Delete the stack when no longer needed to avoid ongoing charges.
+
+Parameters:
+#-- Source parameters
+  DmsSubnetGroupId:
+    Type: String
+    Description: DMS Subnet Group ID
+  DmsVpcSecurityGroupId:
+    Type: String
+    Description: DMS VPC Security Group ID
+  DmsSourceEndpointArn:
+    Type: String
+    Description: ARN of an existing DMS source endpoint for the on-premises SQL database
+  DmsSourceSecretArn:
+    Type: String
+    Description: ARN of the existing AWS Secrets Manager secret used by the DMS source endpoint
+  DmsSourceTableName:
+    Type: String
+    Default: 'market_rule'
+    Description: SQL source table name for DMS replication
+#-- Destination parameters
+  GlueDatabaseName:
+    Type: String
+    Default: 'market_db'
+    Description: AWS Glue catalog database name
+  GlueTableName:
+    Type: String
+    Default: 'market_rule'
+    Description: AWS Glue catalog table name
+  S3BucketName:
+    Type: String
+    Default: 'amzn-s3-demo-market-bucket' 
+    Description: S3 bucket for Firehose destination, which is also the Iceberg table location
+  IcebergUniqueKey:
+    Type: String
+    Default: 'rule_id'
+    Description: Unique key column for Iceberg table upserts
+
+
+Resources:
+
+  # --- IAM Roles ---
+  # Note: Inline policies used for self-contained sample. In production, use managed policies.
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaKinesisFirehoseAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListShards
+                Resource: !GetAtt KinesisStream.Arn
+
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-firehose-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FirehoseAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListShards
+                Resource: !GetAtt KinesisStream.Arn
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !Sub arn:aws:s3:::${S3BucketName}
+                  - !Sub arn:aws:s3:::${S3BucketName}/*
+              - Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:GetTableVersion
+                  - glue:GetTableVersions
+                  - glue:GetDatabase
+                  - glue:UpdateTable
+                Resource:
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabaseName}
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabaseName}/${GlueTableName}
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                  - lambda:GetFunctionConfiguration
+                Resource: !Sub ${LambdaFunction.Arn}:*
+              - Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                  - logs:CreateLogStream
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesisfirehose/${AWS::StackName}-firehose:*
+
+  DmsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-dms-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: dms.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DmsKinesisAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                Resource: !GetAtt KinesisStream.Arn
+        - PolicyName: DmsSecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref DmsSourceSecretArn
+
+  # --- AWS Key Management Service (AWS KMS) Key for Amazon CloudWatch Logs ---
+  LogGroupKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowAccountManagement
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*' # refers to this key only
+          - Sid: AllowCloudWatchLogs
+            Effect: Allow
+            Principal:
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*' # refers to this key only
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*
+
+  # --- Amazon CloudWatch Logs ---
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-lambda-processor
+      RetentionInDays: 14
+      KmsKeyId: !GetAtt LogGroupKmsKey.Arn
+
+  FirehoseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/kinesisfirehose/${AWS::StackName}-firehose
+      RetentionInDays: 14
+      KmsKeyId: !GetAtt LogGroupKmsKey.Arn
+
+  FirehoseBackupLogStream:
+    Type: AWS::Logs::LogStream
+    DependsOn: FirehoseLogGroup
+    Properties:
+      LogGroupName: !Sub /aws/kinesisfirehose/${AWS::StackName}-firehose
+      LogStreamName: BackupDelivery
+
+  FirehoseDestinationLogStream:
+    Type: AWS::Logs::LogStream
+    DependsOn: FirehoseLogGroup
+    Properties:
+      LogGroupName: !Sub /aws/kinesisfirehose/${AWS::StackName}-firehose
+      LogStreamName: DestinationDelivery
+
+  # --- Amazon Kinesis Data Streams ---
+  KinesisStream:
+    DeletionPolicy: Delete
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub ${AWS::StackName}-kinesis
+      ShardCount: 4
+      RetentionPeriodHours: 24
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+
+  # --- AWS Lambda Function ---
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - LambdaRole
+      - LambdaLogGroup
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-lambda-processor
+      Runtime: python3.14
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 180
+      MemorySize: 128
+      ReservedConcurrentExecutions: 10
+      # Note: DLQ is not set here — Amazon Data Firehose handles detection of failed records via error output to S3
+      Architectures:
+        - x86_64
+      Environment:
+        Variables:
+          GLUE_DATABASE_NAME: !Ref GlueDatabaseName
+          GLUE_TABLE_NAME: !Ref GlueTableName
+          DMS_SOURCE_TABLE_NAME: !Ref DmsSourceTableName
+          # WARNING: Set LOG_LEVEL to INFO or higher before deploying to production. 
+          # DEBUG level logs full record payloads which may contain sensitive business data.
+          LOG_LEVEL: DEBUG
+      Code:
+        ZipFile: |
+          import json
+          import base64
+          import os
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
+
+          GLUE_DATABASE_NAME = os.environ['GLUE_DATABASE_NAME']
+          GLUE_TABLE_NAME = os.environ['GLUE_TABLE_NAME']
+          DMS_SOURCE_TABLE_NAME = os.environ['DMS_SOURCE_TABLE_NAME']
+
+          def lambda_handler(firehose_records_input, context):
+              logger.info("lambda_handler() start")
+              logger.debug(f"  GLUE_DATABASE_NAME={GLUE_DATABASE_NAME}")
+              logger.debug(f"  GLUE_TABLE_NAME={GLUE_TABLE_NAME}")
+              logger.debug(f"  DMS_SOURCE_TABLE_NAME={DMS_SOURCE_TABLE_NAME}")
+              logger.info("Receiving " + str(len(firehose_records_input['records'])) + " records from Stream Arn " + firehose_records_input['deliveryStreamArn'])
+
+              firehose_records_output = {'records': []}
+
+              for firehose_record_input in firehose_records_input['records']:
+                  logger.debug("Processing recordId " + firehose_record_input['recordId'])
+                  logger.debug("firehose_record_input: %s", firehose_record_input)
+
+                  try:
+                      payload_bytes = base64.b64decode(firehose_record_input['data']).decode('utf-8')
+                      payload_input_as_json = json.loads(payload_bytes)
+                  except (ValueError, json.JSONDecodeError) as e:
+                      logger.error("Invalid record %s: %s", firehose_record_input['recordId'], e)
+                      continue
+                  logger.debug("payload_input_as_json: %s", payload_input_as_json)
+
+                  metadata_table = payload_input_as_json.get('metadata', {}).get('table-name', '')
+                  if metadata_table != DMS_SOURCE_TABLE_NAME:
+                      logger.info(f"Skipping record, table '{metadata_table}' does not match expected '{DMS_SOURCE_TABLE_NAME}'")
+                      continue
+
+
+                  logger.debug("creating output data payload, applying filtering or casting if needed")
+                  if 'data' not in payload_input_as_json:
+                      logger.debug("Skipping record, no 'data' field in payload")
+                      continue
+                  data_input = payload_input_as_json['data']
+                  logger.debug("data input: %s", data_input)
+
+                  data_output = {}
+                  for key, value in data_input.items():
+                      logger.debug(f"-  {key}: {value} (type {type(value).__name__})")
+                      data_output[key] = value
+
+                  payload_output_as_json = json.dumps(data_output)
+                  payload_output_as_string = str(payload_output_as_json)
+                  payload_output_as_base64 = base64.b64encode(payload_output_as_string.encode('utf-8'))
+                  logger.debug("resulting payload: %s", payload_output_as_json.encode('utf-8'))
+
+                  firehose_record_output = {
+                      'recordId': firehose_record_input['recordId'],
+                      'data': payload_output_as_base64,
+                      'result': 'Ok',
+                      'metadata': {
+                          'otfMetadata': {
+                              'destinationDatabaseName': GLUE_DATABASE_NAME,
+                              'destinationTableName': GLUE_TABLE_NAME,
+                              'operation': payload_input_as_json['metadata']['operation']
+                          }
+                      }
+                  }
+
+                  logger.debug("Processing for record " + firehose_record_input['recordId'] + " completed. Result: %s", firehose_record_output)
+                  firehose_records_output['records'].append(firehose_record_output)
+
+              logger.info("lambda_handler() end")
+              logger.info("returning " + str(len(firehose_records_output['records'])) + " output records, from " + str(len(firehose_records_input['records'])) + " inputs records")
+              return firehose_records_output
+
+
+  # --- Amazon Data Firehose (Apache Iceberg destination with AWS Lambda processor) ---
+  FirehoseDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    DependsOn:
+      - KinesisStream
+      - LambdaFunction
+      - FirehoseRole
+      - FirehoseLogGroup
+      - FirehoseBackupLogStream
+      - FirehoseDestinationLogStream
+    Properties:
+      DeliveryStreamName: !Sub ${AWS::StackName}-firehose
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt KinesisStream.Arn
+        RoleARN: !GetAtt FirehoseRole.Arn
+      IcebergDestinationConfiguration:
+        RoleARN: !GetAtt FirehoseRole.Arn
+        CatalogConfiguration:
+          # Note - this uses the default catalog by default. Adjust as needed.
+          CatalogARN: !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
+        S3Configuration:
+          RoleARN: !GetAtt FirehoseRole.Arn
+          BucketARN: !Sub arn:aws:s3:::${S3BucketName}
+          BufferingHints:
+            SizeInMBs: 1
+            IntervalInSeconds: 60
+          CompressionFormat: UNCOMPRESSED
+          CloudWatchLoggingOptions:
+            Enabled: true
+            LogGroupName: !Sub /aws/kinesisfirehose/${AWS::StackName}-firehose
+            LogStreamName: BackupDelivery
+        DestinationTableConfigurationList:
+          - DestinationTableName: !Ref GlueTableName
+            DestinationDatabaseName: !Ref GlueDatabaseName
+            UniqueKeys:
+              - !Ref IcebergUniqueKey
+            S3ErrorOutputPrefix: firehose-errors/
+        BufferingHints:
+          SizeInMBs: 1
+          IntervalInSeconds: 3
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Sub /aws/kinesisfirehose/${AWS::StackName}-firehose
+          LogStreamName: DestinationDelivery
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: Lambda
+              Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !Sub ${LambdaFunction.Arn}:$LATEST
+                - ParameterName: NumberOfRetries
+                  ParameterValue: '3'
+                - ParameterName: RoleArn
+                  ParameterValue: !GetAtt FirehoseRole.Arn
+                - ParameterName: BufferSizeInMBs
+                  ParameterValue: '0.2'
+                - ParameterName: BufferIntervalInSeconds
+                  ParameterValue: '3'
+        RetryOptions:
+          DurationInSeconds: 3
+        S3BackupMode: FailedDataOnly
+
+  # --- AWS DMS Target Endpoint (Amazon Kinesis Data Streams) ---
+  DmsTargetEndpoint:
+    Type: AWS::DMS::Endpoint
+    DependsOn: KinesisStream
+    Properties:
+      EndpointIdentifier: !Sub ${AWS::StackName}-kinesis-target-endpoint
+      EndpointType: target
+      EngineName: kinesis
+      KinesisSettings:
+        StreamArn: !GetAtt KinesisStream.Arn
+        MessageFormat: json
+        ServiceAccessRoleArn: !GetAtt DmsRole.Arn
+
+  # --- AWS DMS Serverless Replication (CDC) ---
+  DmsReplicationConfig:
+    Type: AWS::DMS::ReplicationConfig
+    DependsOn:
+      - DmsTargetEndpoint
+    Properties:
+      ReplicationConfigIdentifier: !Sub ${AWS::StackName}-dms-task
+      ReplicationType: cdc
+      SourceEndpointArn: !Ref DmsSourceEndpointArn
+      TargetEndpointArn: !Ref DmsTargetEndpoint
+      ComputeConfig:
+        MaxCapacityUnits: 2
+        MinCapacityUnits: 1
+        MultiAZ: true
+        ReplicationSubnetGroupId: !Ref DmsSubnetGroupId
+        VpcSecurityGroupIds:
+          - !Ref DmsVpcSecurityGroupId
+      TableMappings:
+        rules:
+          - rule-id: 1
+            rule-name: include-table
+            rule-type: selection
+            rule-action: include
+            object-locator:
+              schema-name: "%"
+              table-name: !Ref DmsSourceTableName
+            filters: []
+      ReplicationSettings:
+        Logging:
+          EnableLogging: true
+          EnableLogContext: true
+          LogComponents:
+            - Id: TRANSFORMATION
+              Severity: LOGGER_SEVERITY_DETAILED_DEBUG
+            - Id: SOURCE_UNLOAD
+              Severity: LOGGER_SEVERITY_DETAILED_DEBUG
+            - Id: TARGET_LOAD
+              Severity: LOGGER_SEVERITY_DETAILED_DEBUG
+            - Id: SOURCE_CAPTURE
+              Severity: LOGGER_SEVERITY_DETAILED_DEBUG
+            - Id: TARGET_APPLY
+              Severity: LOGGER_SEVERITY_DETAILED_DEBUG
+            - Id: TASK_MANAGER
+              Severity: LOGGER_SEVERITY_DETAILED_DEBUG
+        FullLoadSettings:
+          TargetTablePrepMode: DROP_AND_CREATE
+          MaxFullLoadSubTasks: 8
+          CommitRate: 10000
+        TargetMetadata:
+          SupportLobs: true
+          LimitedSizeLobMode: true
+          LobMaxSize: 32
+        ChangeProcessingTuning:
+          CommitTimeout: 1
+          MemoryLimitTotal: 1024
+          MemoryKeepTime: 60
+          StatementCacheSize: 50
+
+Outputs:
+  KinesisStreamArn:
+    Value: !GetAtt KinesisStream.Arn
+  LambdaFunctionArn:
+    Value: !GetAtt LambdaFunction.Arn
+  FirehoseDeliveryStreamArn:
+    Value: !GetAtt FirehoseDeliveryStream.Arn
+  DmsReplicationConfigArn:
+    Value: !Ref DmsReplicationConfig
+  LambdaRoleArn:
+    Value: !GetAtt LambdaRole.Arn
+  FirehoseRoleArn:
+    Value: !GetAtt FirehoseRole.Arn
+  DmsRoleArn:
+    Value: !GetAtt DmsRole.Arn
