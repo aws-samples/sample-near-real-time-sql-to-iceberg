@@ -24,7 +24,7 @@
 #     --parameters \
 #       ParameterKey=DmsSourceEndpointArn,ParameterValue=arn:aws:dms:us-east-1:123456789012:endpoint:my-source-endpoint \
 #       ParameterKey=DmsSourceSecretArn,ParameterValue=arn:aws:secretsmanager:us-east-1:123456789012:secret:my-dms-secret \
-#       ParameterKey=DmsSubnetGroupId,ParameterValue=my-dms-subnet-group \
+#       ParameterKey=DmsSubnetGroupArn,ParameterValue=arn:aws:dms:us-east-1:123456789012:subgrp:my-dms-subnet-group \
 #       ParameterKey=DmsVpcSecurityGroupId,ParameterValue=sg-0123456789abcdef0
 
 # Verify deployment:
@@ -68,6 +68,13 @@
 #   - Set up Amazon CloudWatch alarms for security
 #   - Use VPC endpoints to keep traffic off the public internet
 #   - Encrypt inbound and outbound data stores
+
+# Disclaimer -
+# Set LOG_LEVEL to INFO or higher before deploying to production to avoid logging sensitive data
+# Schema evolution is to be handled manually in both source and destination tables
+# This template is provided to support the replication of a single table defined in CloudFormation parameters, but can be adapted to replicate several tables within the same pipeline.
+# INSERT, UPDATE and DELETE operations have been tested.
+
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   Source Endpoint -> AWS DMS -> Amazon Kinesis Data Streams -> Amazon Data Firehose (via AWS Lambda) -> Apache Iceberg pipeline with AWS DMS Serverless CDC from MySQL Server.
@@ -75,11 +82,16 @@ Description: >
 
 Parameters:
 #-- Source parameters
-  DmsSubnetGroupId:
+  DmsSubnetGroupArn:
     Type: String
-    Description: DMS Subnet Group ID
+    Description: >-
+      ARN of the DMS replication subnet group
+      (e.g. arn:aws:dms:us-east-1:123456789012:subgrp:my-dms-subnet-group).
+      The subnet group identifier is extracted from the last element of the ARN.
+    AllowedPattern: '^arn:aws[a-z-]*:dms:[a-z0-9-]+:\d{12}:subgrp:[a-z][a-z0-9-]*$'
+    ConstraintDescription: Must be a valid DMS subnet group ARN (e.g. arn:aws:dms:us-east-1:123456789012:subgrp:my-dms-subnet-group)
   DmsVpcSecurityGroupId:
-    Type: String
+    Type: AWS::EC2::SecurityGroup::Id
     Description: DMS VPC Security Group ID
   DmsSourceEndpointArn:
     Type: String
@@ -485,14 +497,14 @@ Resources:
       - DmsTargetEndpoint
     Properties:
       ReplicationConfigIdentifier: !Sub ${AWS::StackName}-dms-task
-      ReplicationType: cdc
+      ReplicationType: full-load-and-cdc
       SourceEndpointArn: !Ref DmsSourceEndpointArn
       TargetEndpointArn: !Ref DmsTargetEndpoint
       ComputeConfig:
         MaxCapacityUnits: 2
         MinCapacityUnits: 1
         MultiAZ: true
-        ReplicationSubnetGroupId: !Ref DmsSubnetGroupId
+        ReplicationSubnetGroupId: !Select [6, !Split [':', !Ref DmsSubnetGroupArn]]
         VpcSecurityGroupIds:
           - !Ref DmsVpcSecurityGroupId
       TableMappings:
@@ -523,13 +535,18 @@ Resources:
             - Id: TASK_MANAGER
               Severity: LOGGER_SEVERITY_DETAILED_DEBUG
         FullLoadSettings:
-          TargetTablePrepMode: DROP_AND_CREATE
+          TargetTablePrepMode: DO_NOTHING
           MaxFullLoadSubTasks: 8
           CommitRate: 10000
         TargetMetadata:
           SupportLobs: true
           LimitedSizeLobMode: true
           LobMaxSize: 32
+          BatchApplyEnabled: false
+        ControlTablesSettings:
+          HistoryTableEnabled: false
+          StatusTableEnabled: false
+          SuspendedTablesTableEnabled: false
         ChangeProcessingTuning:
           CommitTimeout: 1
           MemoryLimitTotal: 1024
