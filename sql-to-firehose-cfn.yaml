@@ -95,7 +95,7 @@ Parameters:
     Description: DMS VPC Security Group ID
   DmsSourceEndpointArn:
     Type: String
-    Description: ARN of an existing DMS source endpoint for the on-premises SQL database
+    Description: ARN of an existing DMS source endpoint for the source SQL database
   DmsSourceSecretArn:
     Type: String
     Description: ARN of the existing AWS Secrets Manager secret used by the DMS source endpoint
