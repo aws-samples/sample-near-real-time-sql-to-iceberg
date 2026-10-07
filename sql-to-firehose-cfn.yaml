@@ -333,7 +333,7 @@ Resources:
           DMS_SOURCE_TABLE_NAME: !Ref DmsSourceTableName
           # WARNING: Set LOG_LEVEL to INFO or higher before deploying to production. 
           # DEBUG level logs full record payloads which may contain sensitive business data.
-          LOG_LEVEL: DEBUG
+          LOG_LEVEL: INFO
       Code:
         ZipFile: |
           import json
@@ -474,7 +474,7 @@ Resources:
                 - ParameterName: BufferIntervalInSeconds
                   ParameterValue: '3'
         RetryOptions:
-          DurationInSeconds: 3
+          DurationInSeconds: 300
         S3BackupMode: FailedDataOnly
 
   # --- AWS DMS Target Endpoint (Amazon Kinesis Data Streams) ---
