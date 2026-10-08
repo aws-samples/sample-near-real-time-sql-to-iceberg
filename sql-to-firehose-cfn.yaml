@@ -366,44 +366,76 @@ Resources:
                       payload_input_as_json = json.loads(payload_bytes)
                   except (ValueError, json.JSONDecodeError) as e:
                       logger.error("Invalid record %s: %s", firehose_record_input['recordId'], e)
+                      # Firehose needs every input recordId back with a result. A malformed
+                      # payload is a real error, so mark it ProcessingFailed (routed to the
+                      # S3 error prefix). 'data' is required, so echo the original payload.
+                      firehose_records_output['records'].append({
+                          'recordId': firehose_record_input['recordId'],
+                          'result': 'ProcessingFailed',
+                          'data': firehose_record_input['data'],
+                      })
                       continue
                   logger.debug("payload_input_as_json: %s", payload_input_as_json)
 
                   metadata_table = payload_input_as_json.get('metadata', {}).get('table-name', '')
                   if metadata_table != DMS_SOURCE_TABLE_NAME:
                       logger.info(f"Skipping record, table '{metadata_table}' does not match expected '{DMS_SOURCE_TABLE_NAME}'")
+                      # Intentional skip: mark Dropped so Firehose counts it as processed.
+                      firehose_records_output['records'].append({
+                          'recordId': firehose_record_input['recordId'],
+                          'result': 'Dropped',
+                          'data': firehose_record_input['data'],
+                      })
                       continue
 
 
                   logger.debug("creating output data payload, applying filtering or casting if needed")
                   if 'data' not in payload_input_as_json:
                       logger.debug("Skipping record, no 'data' field in payload")
+                      # Nothing to write to Iceberg (e.g. a control record): mark Dropped.
+                      firehose_records_output['records'].append({
+                          'recordId': firehose_record_input['recordId'],
+                          'result': 'Dropped',
+                          'data': firehose_record_input['data'],
+                      })
                       continue
                   data_input = payload_input_as_json['data']
                   logger.debug("data input: %s", data_input)
 
-                  data_output = {}
-                  for key, value in data_input.items():
-                      logger.debug(f"-  {key}: {value} (type {type(value).__name__})")
-                      data_output[key] = value
+                  try:
+                      data_output = {}
+                      for key, value in data_input.items():
+                          logger.debug(f"-  {key}: {value} (type {type(value).__name__})")
+                          data_output[key] = value
 
-                  payload_output_as_json = json.dumps(data_output)
-                  payload_output_as_string = str(payload_output_as_json)
-                  payload_output_as_base64 = base64.b64encode(payload_output_as_string.encode('utf-8'))
-                  logger.debug("resulting payload: %s", payload_output_as_json.encode('utf-8'))
+                      payload_output_as_json = json.dumps(data_output)
+                      payload_output_as_string = str(payload_output_as_json)
+                      payload_output_as_base64 = base64.b64encode(payload_output_as_string.encode('utf-8'))
+                      logger.debug("resulting payload: %s", payload_output_as_json.encode('utf-8'))
 
-                  firehose_record_output = {
-                      'recordId': firehose_record_input['recordId'],
-                      'data': payload_output_as_base64,
-                      'result': 'Ok',
-                      'metadata': {
-                          'otfMetadata': {
-                              'destinationDatabaseName': GLUE_DATABASE_NAME,
-                              'destinationTableName': GLUE_TABLE_NAME,
-                              'operation': payload_input_as_json['metadata']['operation']
+                      firehose_record_output = {
+                          'recordId': firehose_record_input['recordId'],
+                          'data': payload_output_as_base64.decode('utf-8'),
+                          'result': 'Ok',
+                          'metadata': {
+                              'otfMetadata': {
+                                  'destinationDatabaseName': GLUE_DATABASE_NAME,
+                                  'destinationTableName': GLUE_TABLE_NAME,
+                                  'operation': payload_input_as_json['metadata']['operation']
+                              }
                           }
                       }
-                  }
+                  except (KeyError, AttributeError, TypeError) as e:
+                      logger.error("Malformed record %s: %s", firehose_record_input['recordId'], e)
+                      # Parseable JSON but missing/invalid fields (e.g. no 'operation',
+                      # or 'data' is not an object). A real error: mark ProcessingFailed so
+                      # it is routed to S3 instead of crashing and retrying the whole batch.
+                      firehose_records_output['records'].append({
+                          'recordId': firehose_record_input['recordId'],
+                          'result': 'ProcessingFailed',
+                          'data': firehose_record_input['data'],
+                      })
+                      continue
 
                   logger.debug("Processing for record " + firehose_record_input['recordId'] + " completed. Result: %s", firehose_record_output)
                   firehose_records_output['records'].append(firehose_record_output)
